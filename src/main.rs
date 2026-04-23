@@ -1,6 +1,6 @@
 use std::io;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const COLOR_RESET: &str = "\x1b[0m";
 const COLOR_BOLD: &str = "\x1b[1m";
@@ -10,11 +10,26 @@ const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_MAGENTA: &str = "\x1b[35m";
 const COLOR_BLUE: &str = "\x1b[34m";
 
+const PCI_IDS_PATH: &str = "/usr/share/hwdata/pci.ids";
+
+struct CpuState {
+    last_energy: u64,
+    last_time: Instant,
+}
+
 fn main() {
     print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
     
     let mut sensors_list: Vec<String> = Vec::new();
     dev_sensors(&mut sensors_list);
+    
+    // Инициализация состояния CPU для плавного расчета Power
+    let raw_cpu_power_path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj";
+    let mut cpu_state = CpuState {
+        last_energy: fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0),
+        last_time: Instant::now(),
+    };
+
     let resmon_logo = r#"
     ____           __  ___           
    / __ \___  ____/  |/  /___  ____  
@@ -39,38 +54,47 @@ fn main() {
     }
 
     loop {
+        let loop_start = Instant::now();
         print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+        
         match final_input {
             "a" => {
                 display_gpu(&sensors_list);
                 println!();
                 display_memory();
                 println!();
-                display_cpu(&sensors_list);
+                display_cpu(&sensors_list, &mut cpu_state);
             }
             "g" => display_gpu(&sensors_list),
-            "c" => display_cpu(&sensors_list),
+            "c" => display_cpu(&sensors_list, &mut cpu_state),
             "m" => display_memory(),
             _ => break,
         }
-        std::thread::sleep(Duration::from_secs(1));
+
+        // Компенсируем время выполнения кода, чтобы цикл был ровно 1 секунду
+        let elapsed = loop_start.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_secs(1) - elapsed);
+        }
     }
 }
 
 fn display_gpu(sensors_list: &Vec<String>) {
-    let stats = parse_gpu(sensors_list);
+    let sensor_path = find_driver_path("amdgpu", sensors_list);
+    let stats = parse_gpu(&sensor_path);
+    let gpu_name = parse_gpu_name(&sensor_path);
     print_table(
-        "GPU Status",
+        &format!("GPU: {}", gpu_name),
         &["Fan Speed (RPM)", "Clock (MHz)", "Mem Clock (MHz)", "Temp (°C)", "Power (W)"],
         &[stats[0].to_string(), stats[1].to_string(), stats[2].to_string(), stats[3].to_string(), stats[4].to_string()],
         COLOR_MAGENTA,
     );
 }
 
-fn display_cpu(sensors_list: &Vec<String>) {
-    let stats = parse_cpu(sensors_list);
+fn display_cpu(sensors_list: &Vec<String>, state: &mut CpuState) {
+    let stats = parse_cpu(sensors_list, state);
     print_table(
-        "CPU Status",
+        &format!("CPU: {}", parse_cpu_name()),
         &["Frequency (MHz)", "Temperature (°C)", "Power (W)"],
         &[stats[0].to_string(), stats[1].to_string(), stats[2].to_string()],
         COLOR_BLUE,
@@ -80,7 +104,7 @@ fn display_cpu(sensors_list: &Vec<String>) {
 fn display_memory() {
     let stats = parse_memory();
     print_table(
-        "Memory Status",
+        "RAM",
         &["Total (MB)", "Available (MB)", "Usage (%)"],
         &[
             format!("{:.2}", stats[0]),
@@ -155,13 +179,61 @@ fn find_driver_path(target_driver: &str, sensors_list: &[String]) -> String {
     "not_found".to_string()
 }
 
-fn parse_gpu(sensors_list: &Vec<String>) -> [i32; 5] {
+fn parse_gpu_name(sensor_path: &str) -> String {
+    if sensor_path == "not_found" {
+        return "GPU Not Found".to_string();
+    }
+
+    let vendor_path = format!("{}/device/vendor", sensor_path);
+    let device_path = format!("{}/device/device", sensor_path);
+
+    let vendor = fs::read_to_string(vendor_path)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("0x")
+        .to_lowercase();
+    let device = fs::read_to_string(device_path)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("0x")
+        .to_lowercase();
+
+    if vendor.is_empty() || device.is_empty() {
+        return "Unknown AMD GPU".to_string();
+    }
+
+    if let Ok(content) = fs::read_to_string(PCI_IDS_PATH) {
+        let mut target_vendor_found = false;
+        for line in content.lines() {
+            if line.starts_with(&vendor) {
+                target_vendor_found = true;
+                continue;
+            }
+
+            if target_vendor_found {
+                if line.starts_with('\t') && line.trim_start().starts_with(&device) {
+                    return line.splitn(2, "  ").nth(1).unwrap_or("Unknown").trim().to_string();
+                }
+                if !line.starts_with('\t') && !line.starts_with('#') && !line.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
+    format!("AMD GPU ({}:{})", vendor, device)
+}
+
+fn parse_gpu(sensor_path: &str) -> [i32; 5] {
     let mut gpu_stats = [0; 5];
-    let sensor = find_driver_path("amdgpu", sensors_list);
+    if sensor_path == "not_found" {
+        return gpu_stats;
+    }
+
     let paths = ["fan1_input", "freq1_input", "freq2_input", "temp1_input", "power1_input"];
     
     for (i, path) in paths.iter().enumerate() {
-        let full_path = format!("{}/{}", sensor, path);
+        let full_path = format!("{}/{}", sensor_path, path);
         let mut val: u64 = fs::read_to_string(full_path)
             .unwrap_or_default()
             .trim()
@@ -179,7 +251,7 @@ fn parse_gpu(sensors_list: &Vec<String>) -> [i32; 5] {
     gpu_stats
 }
 
-fn parse_cpu(sensors_list: &Vec<String>) -> [i32; 3] {
+fn parse_cpu(sensors_list: &[String], state: &mut CpuState) -> [i32; 3] {
     let cpu_freq_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq";
     let raw_cpu_power_path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj";
     let sensor = find_driver_path("coretemp", sensors_list);
@@ -188,14 +260,34 @@ fn parse_cpu(sensors_list: &Vec<String>) -> [i32; 3] {
     let freq = fs::read_to_string(cpu_freq_path).unwrap_or_default().trim().parse::<i32>().unwrap_or(0) / 1000;
     let temp = fs::read_to_string(cpu_temp_path).unwrap_or_default().trim().parse::<i32>().unwrap_or(0) / 1000;
     
-    let e1: u64 = fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0);
-    let t1 = std::time::Instant::now();
-    std::thread::sleep(Duration::from_millis(100));
-    let e2: u64 = fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0);
-    let t2 = std::time::Instant::now();
+    // Плавный расчет мощности на основе разницы времени и энергии
+    let current_energy: u64 = fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0);
+    let current_time = Instant::now();
     
-    let p = ((e2.saturating_sub(e1)) as f32 / t2.duration_since(t1).as_secs_f32()) / 1_000_000.0;
-    [freq, temp, p as i32]
+    let energy_diff = current_energy.saturating_sub(state.last_energy);
+    let time_diff = current_time.duration_since(state.last_time).as_secs_f32();
+    
+    let power = if time_diff > 0.0 {
+        (energy_diff as f32 / time_diff) / 1_000_000.0
+    } else {
+        0.0
+    };
+
+  
+    state.last_energy = current_energy;
+    state.last_time = current_time;
+
+    [freq, temp, power as i32]
+}
+
+fn parse_cpu_name() -> String {
+    let raw_str = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    for line in raw_str.lines() {
+        if line.contains("model name") {
+            return line.split(':').nth(1).unwrap_or("").trim().to_string();
+        } 
+    }
+    "Unknown CPU".to_string()
 }
 
 fn parse_memory() -> [f64; 3] {
