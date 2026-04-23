@@ -23,7 +23,7 @@ fn main() {
     let mut sensors_list: Vec<String> = Vec::new();
     dev_sensors(&mut sensors_list);
     
-    // Инициализация состояния CPU для плавного расчета Power
+    
     let raw_cpu_power_path = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj";
     let mut cpu_state = CpuState {
         last_energy: fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0),
@@ -71,7 +71,7 @@ fn main() {
             _ => break,
         }
 
-        // Компенсируем время выполнения кода, чтобы цикл был ровно 1 секунду
+        
         let elapsed = loop_start.elapsed();
         if elapsed < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_secs(1) - elapsed);
@@ -260,7 +260,7 @@ fn parse_cpu(sensors_list: &[String], state: &mut CpuState) -> [i32; 3] {
     let freq = fs::read_to_string(cpu_freq_path).unwrap_or_default().trim().parse::<i32>().unwrap_or(0) / 1000;
     let temp = fs::read_to_string(cpu_temp_path).unwrap_or_default().trim().parse::<i32>().unwrap_or(0) / 1000;
     
-    // Плавный расчет мощности на основе разницы времени и энергии
+
     let current_energy: u64 = fs::read_to_string(raw_cpu_power_path).unwrap_or_default().trim().parse().unwrap_or(0);
     let current_time = Instant::now();
     
